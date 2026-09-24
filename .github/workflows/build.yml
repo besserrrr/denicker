@@ -1,0 +1,32 @@
+name: Build Denicker
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 8
+
+      - name: Install Gradle 2.14.1
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-2.14.1-bin.zip
+          unzip -q gradle-2.14.1-bin.zip -d "$HOME"
+          echo "$HOME/gradle-2.14.1/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: gradle setupCIWorkspace build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Denicker-jar
+          path: build/libs/*.jar
