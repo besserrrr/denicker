@@ -11,29 +11,42 @@ import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.network.FMLNetworkEvent;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Packet-only denicker. Uses:
+ *  S38PacketPlayerListItem -> names in the tab list (the nick is shown here)
+ *  S3EPacketTeams          -> names inside scoreboard teams (a real name may appear here)
+ *  S3CPacketUpdateScore    -> names used as scoreboard entries (a real name may appear here)
+ *
+ * Idea: a real name that shows up in team/score packets but has NO tab entry, and that arrived
+ * at the same moment the nick was added to the tab list, is most likely that player's real name.
+ */
 @Mod(modid = Denicker.MODID, name = "Denicker", version = Denicker.VERSION,
         clientSideOnly = true, acceptedMinecraftVersions = "[1.8.9]")
 public class Denicker {
     public static final String MODID = "denicker";
-    public static final String VERSION = "1.0";
+    public static final String VERSION = "1.2";
 
-    // ---- State filled by PacketSniffer (netty thread), read by command/main thread ----
+    /** A name and the moment (ms) + place it was first seen. */
+    public static class Seen {
+        public final String name;
+        public final long time;
+        public final String source;
+        public Seen(String name, long time, String source) {
+            this.name = name; this.time = time; this.source = source;
+        }
+    }
+
     public static final Map<UUID, String> tabNames = new ConcurrentHashMap<UUID, String>();
-    public static final Map<UUID, String> tabDisplay = new ConcurrentHashMap<UUID, String>();
+    public static final Map<String, Seen> tabSeen = new ConcurrentHashMap<String, Seen>();   // lower name -> tab add
+    public static final Map<String, Seen> nameSeen = new ConcurrentHashMap<String, Seen>();  // lower name -> team/score
     public static final Map<String, Set<String>> teams = new ConcurrentHashMap<String, Set<String>>();
     public static final Map<String, String> teamPrefix = new ConcurrentHashMap<String, String>();
     public static final Map<String, String> teamSuffix = new ConcurrentHashMap<String, String>();
-    public static final Set<String> scoreEntries = ConcurrentHashMap.newKeySet();
-    private static final Set<String> reported = ConcurrentHashMap.newKeySet();
+    public static volatile long connectTime = System.currentTimeMillis();
 
     private static final Pattern NAME = Pattern.compile("^[A-Za-z0-9_]{3,16}$");
 
@@ -43,7 +56,6 @@ public class Denicker {
         ClientCommandHandler.instance.registerCommand(new DenickCommand());
     }
 
-    /** Inject our packet listener into the connection's netty pipeline. */
     @SubscribeEvent
     public void onConnect(FMLNetworkEvent.ClientConnectedToServerEvent e) {
         clearAll();
@@ -56,43 +68,129 @@ public class Denicker {
 
     public static void clearAll() {
         tabNames.clear();
-        tabDisplay.clear();
+        tabSeen.clear();
+        nameSeen.clear();
         teams.clear();
         teamPrefix.clear();
         teamSuffix.clear();
-        scoreEntries.clear();
-        reported.clear();
+        connectTime = System.currentTimeMillis();
     }
 
-    /**
-     * Names that show up in team member lists / scoreboard entries but have NO tab-list entry.
-     * On a server that leaks, these are the real names of nicked players.
-     */
-    public static Set<String> findCandidates() {
-        Set<String> tab = new HashSet<String>();
-        for (String n : tabNames.values()) tab.add(n.toLowerCase());
+    // ------------------------------------------------------------------ recording (called by sniffer)
+    public static void noteTab(String name) {
+        if (name != null) tabSeen.putIfAbsent(name.toLowerCase(), new Seen(name, System.currentTimeMillis(), "tab"));
+    }
 
-        Set<String> out = new TreeSet<String>();
-        for (Set<String> members : teams.values()) {
-            for (String n : members) consider(n, tab, out);
+    public static void noteName(String name, String source) {
+        if (name != null) nameSeen.putIfAbsent(name.toLowerCase(), new Seen(name, System.currentTimeMillis(), source));
+    }
+
+    public static void forgetName(String name, String sourceOrNull) {
+        if (name == null) return;
+        Seen s = nameSeen.get(name.toLowerCase());
+        if (s != null && (sourceOrNull == null || sourceOrNull.equals(s.source))) nameSeen.remove(name.toLowerCase());
+    }
+
+    // ------------------------------------------------------------------ analysis
+    /** Valid-looking usernames present in team/score data but with no tab entry. */
+    public static List<Seen> candidates() {
+        List<Seen> out = new ArrayList<Seen>();
+        for (Seen s : nameSeen.values()) {
+            if (NAME.matcher(s.name).matches() && !tabSeen.containsKey(s.name.toLowerCase())) out.add(s);
         }
-        for (String n : scoreEntries) consider(n, tab, out);
         return out;
     }
 
-    private static void consider(String n, Set<String> tab, Set<String> out) {
-        if (n != null && NAME.matcher(n).matches() && !tab.contains(n.toLowerCase())) out.add(n);
+    /** Tab names that appear nowhere in team/score data. */
+    public static List<Seen> orphans() {
+        List<Seen> out = new ArrayList<Seen>();
+        for (Map.Entry<String, Seen> en : tabSeen.entrySet()) {
+            if (!nameSeen.containsKey(en.getKey())) out.add(en.getValue());
+        }
+        return out;
     }
 
-    /** Called by the sniffer after team/score/tab updates; prints newly found names once. */
-    public static void checkAndReport() {
-        for (String n : findCandidates()) {
-            if (reported.add(n.toLowerCase())) {
-                msg("\u00a7aPossible real name: \u00a7e" + n + " \u00a77(in team/score data, not in tab list)");
+    static boolean containsIgnoreCase(Collection<String> c, String s) {
+        for (String x : c) if (x.equalsIgnoreCase(s)) return true;
+        return false;
+    }
+
+    static void checkPlayer(String target) {
+        final Seen t = tabSeen.get(target.toLowerCase());
+        if (t == null) {
+            msg("\u00a7cNo tab entry named \u00a7e" + target + "\u00a7c. Type the nick exactly as in the tab list.");
+            return;
+        }
+        String nick = t.name;
+        msg("Checking \u00a7e" + nick + "\u00a7f (in tab " + ((System.currentTimeMillis() - t.time) / 1000)
+                + "s ago, " + ((t.time - connectTime) / 1000.0) + "s after you joined)");
+
+        boolean nickInData = nameSeen.containsKey(nick.toLowerCase());
+        if (nickInData) {
+            msg("Nick also appears in team/score data \u00a77(consistent name, less likely to leak)");
+        } else {
+            msg("Nick appears in NO team/score data \u00a77(suspicious: a real name may be used there instead)");
+        }
+
+        // Teams that contain the nick
+        for (Map.Entry<String, Set<String>> en : teams.entrySet()) {
+            if (containsIgnoreCase(en.getValue(), nick)) {
+                for (String m : en.getValue()) {
+                    if (!m.equalsIgnoreCase(nick)) {
+                        msg("Team \u00a77" + en.getKey() + "\u00a7f also lists: \u00a7e" + m + " \u00a77(could be a teammate)");
+                    }
+                }
+            }
+        }
+
+        // Unmatched names ranked by how close they arrived to the nick's tab entry
+        final long ref = t.time;
+        List<Seen> cands = candidates();
+        if (cands.isEmpty()) {
+            msg("No unmatched names: every team/score name is a tab player. Nothing leaked for this player.");
+            return;
+        }
+        Collections.sort(cands, new Comparator<Seen>() {
+            public int compare(Seen a, Seen b) {
+                return Long.compare(Math.abs(a.time - ref), Math.abs(b.time - ref));
+            }
+        });
+
+        boolean burst = (t.time - connectTime) < 3000;
+        if (burst) {
+            msg("\u00a77Note: this player was already there when you joined, so timing is unreliable.");
+        }
+
+        msg("Unmatched names closest in time:");
+        int shown = 0;
+        for (Seen s : cands) {
+            msg("  \u00a7e" + s.name + " \u00a77(" + s.source + ", " + String.format("%+d", s.time - ref) + " ms)");
+            if (++shown >= 6) break;
+        }
+
+        // Verdict
+        List<Seen> orph = orphans();
+        boolean targetOrphan = !nickInData;
+        if (cands.size() == 1 && orph.size() == 1 && targetOrphan) {
+            msg("\u00a7aVery likely real name: \u00a7e" + cands.get(0).name
+                    + " \u00a7a(only unmatched name, and " + nick + " is the only unmatched tab entry)");
+        } else if (!burst) {
+            int close = 0;
+            Seen best = null;
+            for (Seen s : cands) {
+                if (Math.abs(s.time - ref) <= 1000) { close++; if (best == null) best = s; }
+            }
+            if (close == 1 && targetOrphan) {
+                msg("\u00a7aLikely real name: \u00a7e" + best.name + " \u00a7a(only unmatched name within 1s of the nick joining)");
+            } else if (close > 1) {
+                msg("\u00a7eSeveral names arrived at the same time, can't pick one.");
+            } else {
+                msg("No unmatched name arrived at the same time as the nick.");
             }
         }
     }
 
+    // ------------------------------------------------------------------ helpers
     public static void msg(final String s) {
         final Minecraft mc = Minecraft.getMinecraft();
         mc.addScheduledTask(new Runnable() {
@@ -104,33 +202,16 @@ public class Denicker {
         });
     }
 
-    /** Looks up the current name for a UUID on Mojang's session server. Null if not a real account. */
-    static String lookupName(UUID id) {
-        try {
-            URL url = new URL("https://sessionserver.mojang.com/session/minecraft/profile/"
-                    + id.toString().replace("-", ""));
-            HttpURLConnection c = (HttpURLConnection) url.openConnection();
-            c.setConnectTimeout(5000);
-            c.setReadTimeout(5000);
-            if (c.getResponseCode() != 200) return null;
-            BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = r.readLine()) != null) sb.append(line);
-            r.close();
-            Matcher m = Pattern.compile("\"name\"\\s*:\\s*\"([^\"]+)\"").matcher(sb.toString());
-            return m.find() ? m.group(1) : null;
-        } catch (Exception ex) {
-            return null;
-        }
+    private static String rel(long t) {
+        return String.format("%.2fs", (t - connectTime) / 1000.0);
     }
 
-    // ------------------------------------------------------------------------------------
+    // ------------------------------------------------------------------ command
     public static class DenickCommand extends CommandBase {
         @Override public String getCommandName() { return "denick"; }
 
         @Override public String getCommandUsage(ICommandSender s) {
-            return "/denick [list|dump|uuid|clear]";
+            return "/denick <nick>  |  /denick list|dump|clear";
         }
 
         @Override public boolean canCommandSenderUseCommand(ICommandSender s) { return true; }
@@ -139,52 +220,42 @@ public class Denicker {
 
         @Override
         public void processCommand(ICommandSender sender, String[] args) {
-            String sub = args.length > 0 ? args[0].toLowerCase() : "list";
+            if (args.length == 0) {
+                msg("Usage: \u00a7e/denick <nick>\u00a7f  (also: list, dump, clear)");
+                return;
+            }
+            String sub = args[0].toLowerCase();
 
             if (sub.equals("clear")) {
                 clearAll();
                 msg("Cleared.");
 
+            } else if (sub.equals("list")) {
+                List<Seen> c = candidates();
+                if (c.isEmpty()) { msg("No unmatched names."); return; }
+                Collections.sort(c, new Comparator<Seen>() {
+                    public int compare(Seen a, Seen b) { return Long.compare(a.time, b.time); }
+                });
+                StringBuilder sb = new StringBuilder();
+                for (Seen s : c) sb.append(s.name).append(" (").append(rel(s.time)).append(") ");
+                msg("Unmatched names (not in tab): \u00a7e" + sb);
+
             } else if (sub.equals("dump")) {
-                // Raw data so you can see exactly what Pika sends and where a leak might be.
-                msg("Tab entries: " + tabNames.size() + ", teams: " + teams.size()
-                        + ", score entries: " + scoreEntries.size());
-                for (Map.Entry<UUID, String> en : tabNames.entrySet()) {
-                    String disp = tabDisplay.get(en.getKey());
-                    System.out.println("[Denicker] TAB " + en.getKey() + " name=" + en.getValue()
-                            + (disp != null ? " display=" + disp : ""));
-                }
-                for (Map.Entry<String, Set<String>> en : teams.entrySet()) {
-                    System.out.println("[Denicker] TEAM " + en.getKey()
-                            + " prefix=" + teamPrefix.get(en.getKey())
-                            + " suffix=" + teamSuffix.get(en.getKey())
-                            + " members=" + en.getValue());
-                }
-                for (String s : scoreEntries) System.out.println("[Denicker] SCORE " + s);
-                msg("Full dump written to your Minecraft log / latest.log.");
+                msg("Tab: " + tabSeen.size() + ", team/score names: " + nameSeen.size() + ", teams: " + teams.size());
+                for (Seen s : tabSeen.values())
+                    System.out.println("[Denicker] TAB " + s.name + " @" + rel(s.time));
+                for (Seen s : nameSeen.values())
+                    System.out.println("[Denicker] NAME " + s.name + " from " + s.source + " @" + rel(s.time));
+                for (Map.Entry<String, Set<String>> en : teams.entrySet())
+                    System.out.println("[Denicker] TEAM " + en.getKey() + " prefix=" + teamPrefix.get(en.getKey())
+                            + " suffix=" + teamSuffix.get(en.getKey()) + " members=" + en.getValue());
+                msg("Dump written to logs/latest.log");
 
-            } else if (sub.equals("uuid")) {
-                msg("Checking tab UUIDs against Mojang...");
-                final Map<UUID, String> snapshot = new HashMap<UUID, String>(tabNames);
-                new Thread(new Runnable() {
-                    public void run() {
-                        int found = 0;
-                        for (Map.Entry<UUID, String> en : snapshot.entrySet()) {
-                            String real = lookupName(en.getKey());
-                            if (real != null && !real.equalsIgnoreCase(en.getValue())) {
-                                found++;
-                                msg("\u00a7e" + en.getValue() + " \u00a77is really \u00a7a" + real);
-                            }
-                            try { Thread.sleep(300); } catch (InterruptedException ie) { return; }
-                        }
-                        msg("UUID check done. Mismatches: " + found);
-                    }
-                }, "Denicker-UUID").start();
+            } else if (sub.equals("check") && args.length > 1) {
+                checkPlayer(args[1]);
 
-            } else { // list
-                Set<String> c = findCandidates();
-                if (c.isEmpty()) msg("No candidates. Try /denick uuid or /denick dump.");
-                else msg("Candidates: \u00a7e" + c);
+            } else {
+                checkPlayer(args[0]);
             }
         }
     }

@@ -6,18 +6,13 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import net.minecraft.network.play.server.S38PacketPlayerListItem;
 import net.minecraft.network.play.server.S3CPacketUpdateScore;
 import net.minecraft.network.play.server.S3EPacketTeams;
-import net.minecraft.util.IChatComponent;
 
 import java.util.Collection;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.Set;
 
-/**
- * Passive listener: records data from the three packets and always passes the packet on unchanged.
- * NOTE: if a method name below doesn't compile with your MCP mappings, use the SRG name instead
- * (e.g. S38: func_179768_b = getAction, func_179767_a = getEntries).
- */
+/** Passive: records S38 / S3E / S3C data and passes every packet on unchanged. */
 public class PacketSniffer extends ChannelInboundHandlerAdapter {
 
     @Override
@@ -31,9 +26,9 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
                 handleScore((S3CPacketUpdateScore) msg);
             }
         } catch (Throwable t) {
-            t.printStackTrace(); // never break the connection because of us
+            t.printStackTrace();
         }
-        super.channelRead(ctx, msg); // pass the packet along untouched
+        super.channelRead(ctx, msg);
     }
 
     private void handleTab(S38PacketPlayerListItem p) {
@@ -44,19 +39,15 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
             UUID id = gp.getId();
 
             if (action == S38PacketPlayerListItem.Action.ADD_PLAYER) {
-                if (gp.getName() != null) Denicker.tabNames.put(id, gp.getName());
-                IChatComponent dn = d.getDisplayName();
-                if (dn != null) Denicker.tabDisplay.put(id, dn.getUnformattedText());
-            } else if (action == S38PacketPlayerListItem.Action.UPDATE_DISPLAY_NAME) {
-                IChatComponent dn = d.getDisplayName();
-                if (dn != null) Denicker.tabDisplay.put(id, dn.getUnformattedText());
-                else Denicker.tabDisplay.remove(id);
+                if (gp.getName() != null) {
+                    Denicker.tabNames.put(id, gp.getName());
+                    Denicker.noteTab(gp.getName());
+                }
             } else if (action == S38PacketPlayerListItem.Action.REMOVE_PLAYER) {
-                Denicker.tabNames.remove(id);
-                Denicker.tabDisplay.remove(id);
+                String n = Denicker.tabNames.remove(id);
+                if (n != null) Denicker.tabSeen.remove(n.toLowerCase());
             }
         }
-        Denicker.checkAndReport();
     }
 
     private void handleTeams(S3EPacketTeams p) {
@@ -64,36 +55,50 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
         String team = p.getName();
         if (team == null) return;
         Collection<String> players = p.getPlayers();
+        String src = "team:" + team;
 
         switch (mode) {
-            case 0: // create
+            case 0: { // create
                 Set<String> set = ConcurrentHashMap.newKeySet();
-                if (players != null) set.addAll(players);
+                if (players != null) {
+                    set.addAll(players);
+                    for (String n : players) Denicker.noteName(n, src);
+                }
                 Denicker.teams.put(team, set);
                 store(team, p);
                 break;
-            case 1: // remove
-                Denicker.teams.remove(team);
+            }
+            case 1: { // remove
+                Set<String> old = Denicker.teams.remove(team);
+                if (old != null) for (String n : old) Denicker.forgetName(n, src);
                 Denicker.teamPrefix.remove(team);
                 Denicker.teamSuffix.remove(team);
                 break;
+            }
             case 2: // update info
                 store(team, p);
                 break;
-            case 3: // add players
+            case 3: { // add players
                 Set<String> cur = Denicker.teams.get(team);
                 if (cur == null) {
                     cur = ConcurrentHashMap.newKeySet();
                     Denicker.teams.put(team, cur);
                 }
-                if (players != null) cur.addAll(players);
+                if (players != null) {
+                    cur.addAll(players);
+                    for (String n : players) Denicker.noteName(n, src);
+                }
                 break;
-            case 4: // remove players
-                Set<String> cur2 = Denicker.teams.get(team);
-                if (cur2 != null && players != null) cur2.removeAll(players);
+            }
+            case 4: { // remove players
+                Set<String> cur = Denicker.teams.get(team);
+                if (players != null) {
+                    if (cur != null) cur.removeAll(players);
+                    for (String n : players) Denicker.forgetName(n, src);
+                }
                 break;
+            }
         }
-        Denicker.checkAndReport();
     }
 
     private void store(String team, S3EPacketTeams p) {
@@ -105,10 +110,9 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
         String entry = p.getPlayerName();
         if (entry == null) return;
         if (p.getScoreAction() == S3CPacketUpdateScore.Action.REMOVE) {
-            Denicker.scoreEntries.remove(entry);
+            Denicker.forgetName(entry, "score");
         } else {
-            Denicker.scoreEntries.add(entry);
+            Denicker.noteName(entry, "score");
         }
-        Denicker.checkAndReport();
     }
 }
