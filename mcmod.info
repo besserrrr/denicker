@@ -1,0 +1,7 @@
+[{
+  "modid": "denicker",
+  "name": "Denicker",
+  "description": "Passive packet-based denicker (S38/S3E/S3C).",
+  "version": "${version}",
+  "mcversion": "${mcversion}"
+}]
