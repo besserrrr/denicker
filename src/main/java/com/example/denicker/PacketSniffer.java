@@ -3,16 +3,24 @@ package com.example.denicker;
 import com.mojang.authlib.GameProfile;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import net.minecraft.network.play.server.S01PacketJoinGame;
+import net.minecraft.network.play.server.S07PacketRespawn;
 import net.minecraft.network.play.server.S38PacketPlayerListItem;
 import net.minecraft.network.play.server.S3CPacketUpdateScore;
 import net.minecraft.network.play.server.S3EPacketTeams;
+import net.minecraft.network.play.server.S47PacketPlayerListHeaderFooter;
+import net.minecraft.world.WorldSettings;
 
-import java.util.Collection;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
-/** Passive: records S38 / S3E / S3C data and passes every packet on unchanged. */
+/**
+ * Passive listener. Reads:
+ *   S38PacketPlayerListItem  (tab list)
+ *   S3EPacketTeams           (scoreboard teams)
+ *   S3CPacketUpdateScore     (scoreboard scores)
+ * plus S01 (join game) / S07 (respawn) only to reset state on a server transfer, like the proxy does.
+ * Every packet is passed on unchanged.
+ */
 public class PacketSniffer extends ChannelInboundHandlerAdapter {
 
     @Override
@@ -21,14 +29,25 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
             if (msg instanceof S38PacketPlayerListItem) {
                 handleTab((S38PacketPlayerListItem) msg);
             } else if (msg instanceof S3EPacketTeams) {
-                handleTeams((S3EPacketTeams) msg);
+                S3EPacketTeams p = (S3EPacketTeams) msg;
+                Engine.onTeam(p.getAction(), p.getName(), p.getPlayers());
             } else if (msg instanceof S3CPacketUpdateScore) {
-                handleScore((S3CPacketUpdateScore) msg);
+                S3CPacketUpdateScore p = (S3CPacketUpdateScore) msg;
+                Engine.onScore(p.getPlayerName(), p.getScoreAction() == S3CPacketUpdateScore.Action.REMOVE);
+            } else if (msg instanceof S47PacketPlayerListHeaderFooter) {
+                Engine.onServerFooter(((S47PacketPlayerListHeaderFooter) msg).getFooter());
+            } else if (msg instanceof S01PacketJoinGame || msg instanceof S07PacketRespawn) {
+                Engine.sessionReset();
             }
         } catch (Throwable t) {
-            t.printStackTrace();
+            t.printStackTrace(); // never break the connection because of us
         }
         super.channelRead(ctx, msg);
+    }
+
+    private static int gm(S38PacketPlayerListItem.AddPlayerData d) {
+        WorldSettings.GameType t = d.getGameMode();
+        return t == null ? 0 : t.getID();
     }
 
     private void handleTab(S38PacketPlayerListItem p) {
@@ -39,80 +58,14 @@ public class PacketSniffer extends ChannelInboundHandlerAdapter {
             UUID id = gp.getId();
 
             if (action == S38PacketPlayerListItem.Action.ADD_PLAYER) {
-                if (gp.getName() != null) {
-                    Denicker.tabNames.put(id, gp.getName());
-                    Denicker.noteTab(gp.getName());
-                }
+                Engine.onTabAdd(id, gp.getName(), gm(d));
+            } else if (action == S38PacketPlayerListItem.Action.UPDATE_GAME_MODE) {
+                Engine.onGameMode(id, gm(d));
+            } else if (action == S38PacketPlayerListItem.Action.UPDATE_DISPLAY_NAME) {
+                Engine.onDisplayName(id);
             } else if (action == S38PacketPlayerListItem.Action.REMOVE_PLAYER) {
-                String n = Denicker.tabNames.remove(id);
-                if (n != null) Denicker.tabSeen.remove(n.toLowerCase());
+                Engine.onTabRemove(id);
             }
-        }
-    }
-
-    private void handleTeams(S3EPacketTeams p) {
-        int mode = p.getAction();
-        String team = p.getName();
-        if (team == null) return;
-        Collection<String> players = p.getPlayers();
-        String src = "team:" + team;
-
-        switch (mode) {
-            case 0: { // create
-                Set<String> set = ConcurrentHashMap.newKeySet();
-                if (players != null) {
-                    set.addAll(players);
-                    for (String n : players) Denicker.noteName(n, src);
-                }
-                Denicker.teams.put(team, set);
-                store(team, p);
-                break;
-            }
-            case 1: { // remove
-                Set<String> old = Denicker.teams.remove(team);
-                if (old != null) for (String n : old) Denicker.forgetName(n, src);
-                Denicker.teamPrefix.remove(team);
-                Denicker.teamSuffix.remove(team);
-                break;
-            }
-            case 2: // update info
-                store(team, p);
-                break;
-            case 3: { // add players
-                Set<String> cur = Denicker.teams.get(team);
-                if (cur == null) {
-                    cur = ConcurrentHashMap.newKeySet();
-                    Denicker.teams.put(team, cur);
-                }
-                if (players != null) {
-                    cur.addAll(players);
-                    for (String n : players) Denicker.noteName(n, src);
-                }
-                break;
-            }
-            case 4: { // remove players
-                Set<String> cur = Denicker.teams.get(team);
-                if (players != null) {
-                    if (cur != null) cur.removeAll(players);
-                    for (String n : players) Denicker.forgetName(n, src);
-                }
-                break;
-            }
-        }
-    }
-
-    private void store(String team, S3EPacketTeams p) {
-        if (p.getPrefix() != null) Denicker.teamPrefix.put(team, p.getPrefix());
-        if (p.getSuffix() != null) Denicker.teamSuffix.put(team, p.getSuffix());
-    }
-
-    private void handleScore(S3CPacketUpdateScore p) {
-        String entry = p.getPlayerName();
-        if (entry == null) return;
-        if (p.getScoreAction() == S3CPacketUpdateScore.Action.REMOVE) {
-            Denicker.forgetName(entry, "score");
-        } else {
-            Denicker.noteName(entry, "score");
         }
     }
 }
